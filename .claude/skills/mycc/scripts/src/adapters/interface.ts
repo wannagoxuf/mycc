@@ -36,9 +36,21 @@ export interface CCAdapter {
   }>;
 
   /**
-   * 获取单个对话详情
+   * 获取单个对话详情（智能摘要模式）
+   *
+   * 用于恢复会话上下文，限制消息数量和总长度避免上下文溢出
+   *
+   * @param cwd - 工作目录
+   * @param sessionId - 会话 ID
+   * @param maxMessages - 最大返回消息数量（默认 50）
+   * @param maxLength - 最大总长度，单位字符（默认 100000，约 25K tokens）
    */
-  getHistory(cwd: string, sessionId: string): Promise<ConversationHistory | null>;
+  getHistory(
+    cwd: string,
+    sessionId: string,
+    maxMessages?: number,
+    maxLength?: number
+  ): Promise<ConversationHistory | null>;
 
   /**
    * 获取或创建 v2 Session

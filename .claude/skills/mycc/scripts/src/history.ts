@@ -211,12 +211,23 @@ export function readFileSummary(filePath: string, fileSize: number): { firstProm
 // ============ 对话详情（不变） ============
 
 /**
- * 获取具体对话内容
- * 优化：只返回最后一个 summary 之后的消息，节省流量
+ * 获取具体对话内容（智能摘要模式）
+ * 优化：
+ * 1. 只返回最后一个 summary 之后的消息，节省流量
+ * 2. 限制最大返回消息数量（避免上下文溢出）
+ * 3. 限制总内容长度（控制上下文大小）
+ *
+ * @param cwd - 工作目录
+ * @param sessionId - 会话 ID
+ * @param maxMessages - 最大消息数量（默认 50）
+ * @param maxLength - 最大总长度，单位字符（默认 100000，约 25K tokens）
+ * @returns 对话历史，如果不存在或为空则返回 null
  */
 export function getConversation(
   cwd: string,
-  sessionId: string
+  sessionId: string,
+  maxMessages: number = 50,
+  maxLength: number = 100000
 ): ConversationHistory | null {
   // 验证 sessionId 格式（防止路径遍历攻击）
   if (!sessionId || /[<>:"|?*\x00-\x1f\/\\]/.test(sessionId)) {
@@ -276,11 +287,50 @@ export function getConversation(
   const messages: RawHistoryLine[] = [];
   const startIndex = lastSummaryIndex + 1; // summary 之后开始（如果没有 summary 则从 0 开始）
 
+  let messageCount = 0;
+  let totalLength = 0;
+  let truncatedByLength = false;
+
   for (let i = startIndex; i < allMessages.length; i++) {
     const msg = allMessages[i];
     if (msg && typeof msg === "object" && "type" in msg && (msg as any).type !== "summary") {
+      // 计算当前消息的长度
+      const msgLength = JSON.stringify(msg).length;
+
+      // 检查是否超过总长度限制
+      if (totalLength + msgLength > maxLength) {
+        truncatedByLength = true;
+        console.log(`[History] 达到总长度限制 (${maxLength} 字符)，已完成加载 ${messageCount} 条消息`);
+        break;
+      }
+
       messages.push(msg as RawHistoryLine);
+      messageCount++;
+      totalLength += msgLength;
+
+      // 达到消息数量限制后停止
+      if (messageCount >= maxMessages) {
+        console.log(`[History] 达到最大消息数量限制 (${maxMessages})，已完成加载`);
+        break;
+      }
     }
+  }
+
+  // 如果因为长度限制被截断，添加提示消息
+  if (truncatedByLength || messageCount >= maxMessages) {
+    const totalMessages = allMessages.filter((m, idx) => {
+      return m && typeof m === "object" && "type" in m &&
+             idx >= startIndex && (m as any).type !== "summary";
+    }).length;
+
+    messages.push({
+      type: "system",
+      message: {
+        role: "system",
+        content: `[历史记录已截断] 加载了 ${messageCount}/${totalMessages} 条消息（共 ${totalLength}/${maxLength} 字符）。建议在 PC 端查看完整历史。`,
+        id: "history-truncated",
+      },
+    } as RawHistoryLine);
   }
 
   return {

@@ -40,7 +40,7 @@ function buildSessionOptions(model?: string) {
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
 
-  const options: Parameters<typeof unstable_v2_createSession>[0] = {
+  const options: any = {
     model: model || DEFAULT_MODEL,
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
     permissionMode: "bypassPermissions",
@@ -56,7 +56,7 @@ function buildSessionOptions(model?: string) {
     options.executable = "node" as const;
   }
 
-  return options;
+  return options as Parameters<typeof unstable_v2_createSession>[0];
 }
 
 /**
@@ -364,10 +364,17 @@ export class OfficialAdapter implements CCAdapter {
   }
 
   /**
-   * 获取单个对话详情
+   * 获取单个对话详情（智能摘要模式）
+   *
+   * 用于恢复会话上下文，限制消息数量和总长度避免上下文溢出
    */
-  async getHistory(cwd: string, sessionId: string): Promise<ConversationHistory | null> {
-    return getConversation(cwd, sessionId);
+  async getHistory(
+    cwd: string,
+    sessionId: string,
+    maxMessages: number = 50,
+    maxLength: number = 100000
+  ): Promise<ConversationHistory | null> {
+    return getConversation(cwd, sessionId, maxMessages, maxLength);
   }
 
   /**

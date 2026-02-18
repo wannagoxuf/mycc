@@ -2,5 +2,14 @@
   "disabledPlugins": [
     "typescript-lsp",
     "pyright-lsp"
-  ]
+  ],
+  "bypassPermission": {
+    "enabled": true,
+    "toolUse": true,
+    "fileWrite": true,
+    "fileRead": true,
+    "commandExecution": true,
+    "browsing": true,
+    "terminal": true
+  }
 }

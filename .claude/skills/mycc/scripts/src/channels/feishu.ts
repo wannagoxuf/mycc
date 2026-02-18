@@ -424,16 +424,30 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
-   * 从 SSE 事件中提取文本内容
+   * 从 SSE 事件中提取文本内容（带长度限制）
    */
   private extractText(event: SSEEvent): string {
     if (event.type === "text") {
-      return String(event.text ?? "");
+      let text = String(event.text ?? "");
+      // 限制单条文本最大 40000 字符（约 10K tokens）
+      const MAX_TEXT_LENGTH = 40000;
+      if (text.length > MAX_TEXT_LENGTH) {
+        console.log(`[FeishuChannel] 文本块过长 (${text.length} > ${MAX_TEXT_LENGTH})，截断`);
+        text = text.substring(0, MAX_TEXT_LENGTH);
+      }
+      return text;
     }
 
     if (event.type === "content_block_delta") {
       const delta = event.delta as { text?: string } | undefined;
-      return delta?.text ?? "";
+      let text = delta?.text ?? "";
+      // 限制单条 delta 文本最大 40000 字符
+      const MAX_TEXT_LENGTH = 40000;
+      if (text.length > MAX_TEXT_LENGTH) {
+        console.log(`[FeishuChannel] Delta 文本过长 (${text.length} > ${MAX_TEXT_LENGTH})，截断`);
+        text = text.substring(0, MAX_TEXT_LENGTH);
+      }
+      return text;
     }
 
     return "";
@@ -450,7 +464,7 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
-   * 格式化 tool_use 事件为可读文本
+   * 格式化 tool_use 事件为可读文本（带长度限制）
    */
   private formatToolUse(event: Record<string, unknown>): string {
     try {
@@ -459,11 +473,22 @@ export class FeishuChannel implements MessageChannel {
 
       let output = `🔧 使用工具: **${name}**\n`;
 
-      // 格式化输入参数
+      // 格式化输入参数（限制长度）
       if (Object.keys(input).length > 0) {
-        output += "```\n";
-        output += JSON.stringify(input, null, 2);
-        output += "\n```\n";
+        // 将输入转为 JSON 字符串
+        const inputStr = JSON.stringify(input, null, 2);
+        // 限制最大 20000 字符（约 5K tokens）
+        const MAX_INPUT_LENGTH = 20000;
+        if (inputStr.length > MAX_INPUT_LENGTH) {
+          output += "```\n";
+          output += inputStr.substring(0, MAX_INPUT_LENGTH);
+          output += `\n... [已截断 ${inputStr.length - MAX_INPUT_LENGTH} 字符]`;
+          output += "\n```\n";
+        } else {
+          output += "```\n";
+          output += inputStr;
+          output += "\n```\n";
+        }
       }
 
       return output;
@@ -663,13 +688,13 @@ export class FeishuChannel implements MessageChannel {
 
       const receiveIdType = this.config.receiveIdType || "open_id";
 
-      // 检查文本中是否包含表格
-      const tableData = this.parseMarkdownTable(text);
+      // 检查文本中是否包含表格（支持多个表格）
+      const tablesData = this.parseMarkdownTables(text);
 
-      if (tableData) {
-        // 使用交互卡片 + 表格组件
-        const cardContent = this.buildTableCard(tableData.beforeTable, tableData.headers, tableData.rows, tableData.afterTable);
-        return await this.sendInteractiveCard(userId, cardContent);
+      if (tablesData && tablesData.tables.length > 0) {
+        // 递归处理所有表格
+        await this.sendTablesRecursively(userId, tablesData.tables, 0);
+        return true;
       }
 
       // 没有表格，使用普通 Markdown 消息
@@ -718,18 +743,36 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
-   * 发送 Markdown 消息
+   * 发送 Markdown 消息（带长度限制）
    */
   private async sendMarkdownMessage(userId: string, text: string): Promise<boolean> {
     try {
       const receiveIdType = this.config.receiveIdType || "open_id";
+
+      // 飞书消息长度限制（约 100KB，按粗略估算：1 token ≈ 0.25 字符，200K tokens ≈ 50K 字符）
+      // 设置安全限制为 30KB，避免溢出
+      const MAX_LENGTH = 30000;
+      let messageText = text;
+
+      if (text.length > MAX_LENGTH) {
+        const originalLength = text.length;
+        // 保留前 90% 的高优先级内容（开头通常包含关键信息）
+        const keepLength = Math.floor(MAX_LENGTH * 0.9);
+        messageText = text.substring(0, keepLength);
+
+        // 添加截断提示
+        const suffix = `\n\n---\n📋 [内容已截断] 原长度 ${originalLength} 字符，已显示 ${messageText.length} 字符\n💡 建议在 PC 端使用 "claude code" 查看完整内容`;
+        messageText += suffix;
+
+        console.log(`[FeishuChannel] 消息过长 (${originalLength} > ${MAX_LENGTH})，已截断`);
+      }
 
       const responseBody = {
         receive_id: userId,
         msg_type: "post",
         content: JSON.stringify({
           zh_cn: {
-            content: [[{ tag: "md", text }]]
+            content: [[{ tag: "md", text: messageText }]]
           }
         })
       };
@@ -745,7 +788,7 @@ export class FeishuChannel implements MessageChannel {
 
       const result = await response.json();
       if (result.code === 0) {
-        console.log(`[FeishuChannel] ✓ Sent: ${text.substring(0, 30)}${text.length > 30 ? "..." : ""}`);
+        console.log(`[FeishuChannel] ✓ Sent: ${messageText.substring(0, 30)}${messageText.length > 30 ? "..." : ""}`);
         await sleep(1000);
         return true;
       } else {
@@ -904,60 +947,67 @@ export class FeishuChannel implements MessageChannel {
 
   /**
    * 解析 Markdown 表格为飞书交互卡片表格格式
-   * @returns 包含 beforeTable、afterTable 和表格数据的对象，如果没有表格则返回 null
+   * @returns 包含表格列表的对象，如果没有表格则返回 null
    */
-  private parseMarkdownTable(text: string): { beforeTable: string; afterTable: string; headers: string[]; rows: string[][] } | null {
-    // 检测表格：查找包含 | 的连续行，至少 2 行（表头 + 分隔线）
+  private parseMarkdownTables(text: string): { tables: Array<{ beforeTable: string; headers: string[]; rows: string[][] }> } | null {
     const lines = text.split("\n");
-    let tableStart = -1;
-    let tableEnd = -1;
+    const tables: Array<{ beforeTable: string; headers: string[]; rows: string[][] }> = [];
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      // 表格行特征：以 | 开头或包含 |
-      if (line.startsWith("|") || (line.includes("|") && line.includes("|"))) {
-        if (tableStart === -1) {
+    let currentIndex = 0;
+
+    while (currentIndex < lines.length) {
+      let tableStart = -1;
+      let tableEnd = -1;
+
+      // 查找表格开始
+      for (let i = currentIndex; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith("|") || (line.includes("|") && line.includes("|"))) {
           tableStart = i;
-        }
-        // 检查下一行是否是分隔线（包含 |---| 或类似的）
-        if (i + 1 < lines.length && lines[i + 1].trim().match(/^\|?[\s\-:]+\|[\s\-:]+\|?/)) {
-          tableEnd = i + 1;
-          // 继续查找表格的后续行
-          for (let j = i + 2; j < lines.length; j++) {
-            const nextLine = lines[j].trim();
-            if (nextLine.startsWith("|") || nextLine.includes("|")) {
-              tableEnd = j;
-            } else {
-              break;
+          // 检查下一行是否是分隔线
+          if (i + 1 < lines.length && lines[i + 1].trim().match(/^\|?[\s\-:]+\|[\s\-:]+\|?/)) {
+            tableEnd = i + 1;
+            // 继续查找表格后续行
+            for (let j = i + 2; j < lines.length; j++) {
+              const nextLine = lines[j].trim();
+              if (nextLine.startsWith("|") || nextLine.includes("|")) {
+                tableEnd = j;
+              } else {
+                break;
+              }
             }
+            break;
           }
-          break;
         }
       }
+
+      if (tableStart === -1 || tableEnd === -1) {
+        // 没有更多表格，结束
+        if (tables.length === 0) return null;
+        break;
+      }
+
+      // 提取表格前的内容
+      const beforeTable = lines.slice(currentIndex, tableStart).join("\n").trim();
+
+      // 解析表格数据
+      const tableLines = lines.slice(tableStart, tableEnd + 1);
+      const headers = this.parseTableRow(tableLines[0]);
+      const rows = tableLines.slice(2).map(line => this.parseTableRow(line));
+
+      tables.push({ beforeTable, headers, rows });
+
+      // 更新当前索引，跳过已处理的表格
+      currentIndex = tableEnd + 1;
     }
 
-    if (tableStart === -1 || tableEnd === -1) {
-      return null;
-    }
-
-    // 提取表格前的内容
-    const beforeTable = lines.slice(0, tableStart).join("\n").trim();
-
-    // 提取表格后的内容
-    const afterTable = lines.slice(tableEnd + 1).join("\n").trim();
-
-    // 解析表格数据
-    const tableLines = lines.slice(tableStart, tableEnd + 1);
-    const headers = this.parseTableRow(tableLines[0]);
-    const rows = tableLines.slice(2).map(line => this.parseTableRow(line));
-
-    return { beforeTable, afterTable, headers, rows };
+    return tables.length > 0 ? { tables } : null;
   }
 
   /**
-   * 构建飞书交互卡片（带表格）
+   * 构建飞书交互卡片（带单个表格）
    */
-  private buildTableCard(beforeTable: string, headers: string[], rows: string[][], afterTable: string): any {
+  private buildTableCard(beforeTable: string, headers: string[], rows: string[][], afterTable?: string): any {
     const elements: any[] = [];
 
     // 表格前的内容（如果有）
@@ -972,7 +1022,6 @@ export class FeishuChannel implements MessageChannel {
     }
 
     // 飞书表格列定义（使用官方格式）
-    // 为每列生成唯一的 name（英文字母键名）
     const columnKeys = headers.map((_, i) => `col_${i}`);
     const tableColumns = headers.map((h, i) => ({
       name: columnKeys[i],
@@ -981,7 +1030,7 @@ export class FeishuChannel implements MessageChannel {
       width: "120px"
     }));
 
-    // 构建行数据（每行是一个对象，键名必须匹配列的 name）
+    // 构建行数据
     const tableRows = rows.map(row => {
       const rowObj: any = {};
       row.forEach((cell, i) => {
@@ -990,7 +1039,7 @@ export class FeishuChannel implements MessageChannel {
       return rowObj;
     });
 
-    // 添加表格元素（使用飞书官方格式）
+    // 添加表格元素
     elements.push({
       tag: "table",
       columns: tableColumns,
@@ -1010,7 +1059,7 @@ export class FeishuChannel implements MessageChannel {
       });
     }
 
-    // 返回完整的交互卡片（添加 header）
+    // 返回完整的交互卡片
     return {
       config: {
         wide_screen_mode: true
@@ -1023,6 +1072,28 @@ export class FeishuChannel implements MessageChannel {
       },
       elements
     };
+  }
+
+  /**
+   * 递归发送多个表格
+   */
+  private async sendTablesRecursively(userId: string, tables: Array<{ beforeTable: string; headers: string[]; rows: string[][] }>, index: number): Promise<void> {
+    if (index >= tables.length) {
+      return;
+    }
+
+    const table = tables[index];
+
+    // 发送当前表格（作为独立的交互卡片）
+    const cardContent = this.buildTableCard(table.beforeTable, table.headers, table.rows);
+
+    const success = await this.sendInteractiveCard(userId, cardContent);
+    if (!success) {
+      console.error(`[FeishuChannel] ✗ Failed to send table ${index + 1}`);
+    }
+
+    // 继续发送下一个表格
+    await this.sendTablesRecursively(userId, tables, index + 1);
   }
 
   /**
